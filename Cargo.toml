@@ -1,0 +1,9 @@
+[package]
+name = "referenced_based_similarity"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ollama-rs = "0.3.4"
+rayon = "1.12.0"
+sklears-datasets = "0.1.1"
