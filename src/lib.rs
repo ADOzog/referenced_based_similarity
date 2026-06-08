@@ -148,4 +148,70 @@ mod tests {
         let result = add(2, 2);
         assert_eq!(result, 4);
     }
+
+    #[tokio::test]
+    async fn simp_emb_and_top_one_test() {
+        let ollama_cli = ollama_rs::Ollama::default();
+
+        let doc_collection = vec![
+            "Trees have leafs".to_string(),
+            "Cats have tails".to_string(),
+            "I am so glad I have had the time to write this library".to_string(),
+            "Just one more sentance".to_string(),
+        ];
+        let models = vec![
+            "nomic-embed-text:latest".to_string(),
+            "bge-m3:latest".to_string(),
+        ];
+        let embs_set = build_embeddings(&ollama_cli, &doc_collection[..], &models[..])
+            .await
+            .unwrap();
+
+        let new_doc = "This is my doc about trees";
+        let ws = Option::None;
+        let k = 1;
+
+        let top_k: Vec<String> = k_most_similar(&ollama_cli, new_doc, &embs_set, ws, k)
+            .await
+            .unwrap();
+        assert_eq!(top_k[0], doc_collection[0]);
+    }
+    #[tokio::test]
+    async fn custom_weights_emb_and_top_k_test() {
+        let ollama_cli = ollama_rs::Ollama::default();
+
+        let doc_collection = vec![
+            "Trees have leafs".to_string(),
+            "Cats have tails".to_string(),
+            "I am so glad I have had the time to write this library".to_string(),
+            "Just one more sentance".to_string(),
+            "Trees are good for the earth".to_string(),
+        ];
+        let models = vec![
+            "nomic-embed-text:latest".to_string(),
+            "bge-m3:latest".to_string(),
+        ];
+        let embs_set = build_embeddings(&ollama_cli, &doc_collection[..], &models[..])
+            .await
+            .unwrap();
+
+        let new_doc = "This is my doc about trees";
+
+        let mut ws: HashMap<&str, f32> = HashMap::new();
+        ws.insert(&models[0], 0.6);
+        ws.insert(&models[1], 0.4);
+        let wrapped_ws = Option::Some(ws);
+        let k = 2;
+
+        let top_k: Vec<String> = k_most_similar(&ollama_cli, new_doc, &embs_set, wrapped_ws, k)
+            .await
+            .unwrap();
+        let mut top_ks_unorderd = HashSet::new();
+        top_ks_unorderd.insert(&top_k[0]);
+        top_ks_unorderd.insert(&top_k[1]);
+        let mut my_guesses = HashSet::new();
+        my_guesses.insert(&doc_collection[0]);
+        my_guesses.insert(&doc_collection[4]);
+        assert_eq!(top_ks_unorderd, my_guesses);
+    }
 }

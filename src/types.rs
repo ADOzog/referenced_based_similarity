@@ -7,6 +7,7 @@ pub struct DocModelKey {
     pub model: String,
 }
 
+#[derive(Debug)]
 pub enum RBSError {
     Ollama(String),
     KMostSim(String),
