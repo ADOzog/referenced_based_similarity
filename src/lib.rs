@@ -1,16 +1,17 @@
 mod types;
 use std::{
     collections::{BinaryHeap, HashMap, HashSet},
-    vec,
+    fs, vec,
 };
 
+use hf_hub::api::sync::Api;
 use ollama_rs::{Ollama, generation::embeddings::request::GenerateEmbeddingsRequest};
+use rand::{SeedableRng, rngs::SmallRng, seq::SliceRandom};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use serde_json::Deserializer;
 use types::*;
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
 
+// Add an individual test for this
 pub async fn build_embeddings(
     ollama_cli: &Ollama,
     documents: &[String],
@@ -134,20 +135,82 @@ pub async fn k_most_similar(
     Ok(top_k_docs)
 }
 
+// Add a test for this
 fn dot(x: &Vec<f32>, y: &Vec<f32>) -> f32 {
     x.par_iter().zip(y.par_iter()).map(|(a, b)| a * b).sum()
 }
 
-pub async fn optimize_average_weights(embedding_model_list: &Vec<String>) {}
+pub async fn optimize_average_weights(
+    embedding_model_list: &[String],
+    data_set: Option<&[(String, String)]>, // Re-think this type to fit what-ever
+) -> Result<HashMap<String, f32>, RBSError> {
+    let (train_doc_w_labels, test_doc_w_lables): (Vec<(String, String)>, Vec<(String, String)>) =
+        match data_set {
+            Some(ds) => {
+                let size = ds.len(); // Adjust the size as needed
+                let true_count = (size as f64 * 0.8).round() as usize;
+                let false_count = size - true_count;
+                let mut split_locs: Vec<bool> = vec![true; true_count]
+                    .into_iter()
+                    .chain(vec![false; false_count])
+                    .collect();
+
+                let mut rng = SmallRng::seed_from_u64(42);
+
+                split_locs.shuffle(&mut rng);
+
+                let (rhs, lhs): (Vec<_>, Vec<_>) = ds
+                    .to_vec()
+                    .drain(..)
+                    .zip(split_locs.into_iter())
+                    .map(|(l, r)| (l.0, l.1, r))
+                    .partition(|(_, _, b)| *b);
+                (
+                    rhs.into_iter().map(|(x, y, _)| (x, y)).collect(),
+                    lhs.into_iter().map(|(x, y, _)| (x, y)).collect(),
+                )
+            }
+            None => {
+                let hf_api = Api::new()?;
+                let repo = hf_api.dataset("SetFit/20_newsgroups".to_string());
+
+                let train_path = repo.get("train.jsonl")?;
+                let test_path = repo.get("test.jsonl")?;
+
+                let train_data_raw = fs::read(train_path)?;
+                let test_data_raw = fs::read(test_path)?;
+
+                // the error is here
+                let train_data: Vec<NewsDP> = Deserializer::from_slice(&train_data_raw)
+                    .into_iter::<NewsDP>()
+                    .map(|x| x.unwrap())
+                    .collect();
+
+                let test_data: Vec<NewsDP> = Deserializer::from_slice(&test_data_raw)
+                    .into_iter::<NewsDP>()
+                    .map(|x| x.unwrap())
+                    .collect();
+                //println!("{:#?}", train_data);
+                //println!("{:#?}", test_data);
+                (
+                    train_data
+                        .into_iter()
+                        .map(|dp| (dp.text, dp.label_text))
+                        .collect(),
+                    test_data
+                        .into_iter()
+                        .map(|dp| (dp.text, dp.label_text))
+                        .collect(),
+                )
+            }
+        };
+    // Now add pso stuff
+
+    todo!()
+}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
 
     #[tokio::test]
     async fn simp_emb_and_top_one_test() {
@@ -214,4 +277,29 @@ mod tests {
         my_guesses.insert(&doc_collection[4]);
         assert_eq!(top_ks_unorderd, my_guesses);
     }
+
+    #[tokio::test]
+    async fn opt_weights_emb_and_top_k_test() {}
+
+    #[tokio::test]
+    async fn optimizer_test_20news() {
+        let models = vec![
+            "nomic-embed-text:latest".to_string(),
+            "bge-m3:latest".to_string(),
+        ];
+        let ws: HashMap<String, f32> = optimize_average_weights(&models[..], Option::None)
+            .await
+            .unwrap();
+    }
+    /*
+    #[tokio::test]
+    async fn optimizer_test_custom_data() {
+        let models = vec![
+            "nomic-embed-text:latest".to_string(),
+            "bge-m3:latest".to_string(),
+        ];
+        let the_opt_fn: fn(&[String], Option<&[String]>) -> HashMap<String, f32> =
+            optimize_average_weights(embedding_model_list, data_set);
+    }
+    */
 }

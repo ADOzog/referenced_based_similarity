@@ -1,21 +1,52 @@
-use std::{cmp::Ordering, collections::HashMap};
+use std::{cmp::Ordering, io::Error};
 
+use hf_hub::api::sync::ApiError;
 use ollama_rs::error::OllamaError;
+use serde::{Deserialize, Serialize};
+use serde_json::Error as JSError;
 #[derive(Eq, Hash, PartialEq, Clone)]
 pub struct DocModelKey {
     pub document: String,
     pub model: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NewsDP {
+    pub text: String,
+    pub label: u8,
+    pub label_text: String,
+}
+
 #[derive(Debug)]
 pub enum RBSError {
     Ollama(String),
     KMostSim(String),
+    HuggingFace(String),
+    ReadFile(String),
+    Json(String),
 }
 
 impl From<OllamaError> for RBSError {
     fn from(err: OllamaError) -> RBSError {
         RBSError::Ollama(err.to_string())
+    }
+}
+impl From<ApiError> for RBSError {
+    fn from(err: ApiError) -> RBSError {
+        RBSError::HuggingFace(err.to_string())
+    }
+}
+// make a macro for this for future projects
+// this patter comes up a lot
+impl From<Error> for RBSError {
+    fn from(err: Error) -> RBSError {
+        RBSError::ReadFile(err.to_string())
+    }
+}
+
+impl From<JSError> for RBSError {
+    fn from(err: JSError) -> RBSError {
+        RBSError::ReadFile(err.to_string())
     }
 }
 
