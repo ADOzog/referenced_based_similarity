@@ -9,6 +9,10 @@ pub struct DocModelKey {
     pub document: String,
     pub model: String,
 }
+pub struct EmbMaybeLabel {
+    pub emb: Vec<f32>,
+    pub label: Option<String>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NewsDP {

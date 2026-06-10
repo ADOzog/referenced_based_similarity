@@ -16,12 +16,12 @@ pub async fn build_embeddings(
     ollama_cli: &Ollama,
     documents: &[String],
     embedding_model_list: &[String],
-    // truncate: Option<bool>,
-) -> Result<HashMap<DocModelKey, Vec<f32>>, RBSError> {
+    labels: Option<&[&str]>, // truncate: Option<bool>,
+) -> Result<HashMap<DocModelKey, EmbMaybeLabel>, RBSError> {
     // add code to test that ollama is running else ret error and tell user
     // add code validate models using ollama list
     // need to change in the future to allow use to input stuff
-    let mut embs_of_doc: HashMap<DocModelKey, Vec<f32>> = HashMap::new();
+    let mut embs_of_doc: HashMap<DocModelKey, EmbMaybeLabel> = HashMap::new();
     for m in embedding_model_list {
         let emb_request = GenerateEmbeddingsRequest::new(m.to_string(), documents.to_vec().into());
         let mut res = ollama_cli
@@ -35,7 +35,13 @@ pub async fn build_embeddings(
                     document: documents[i].to_string(),
                     model: m.to_string(),
                 },
-                res.next().unwrap(),
+                EmbMaybeLabel {
+                    emb: res.next().unwrap(),
+                    label: match labels {
+                        Some(l) => Some(l[i].to_string()),
+                        None => None,
+                    },
+                },
             );
         }
     }
@@ -45,7 +51,7 @@ pub async fn build_embeddings(
 pub async fn k_most_similar(
     ollama_cli: &Ollama,
     doc: &str,
-    embs_set: &HashMap<DocModelKey, Vec<f32>>,
+    embs_set: &HashMap<DocModelKey, EmbMaybeLabel>,
     avg_weights: Option<HashMap<&str, f32>>,
     k: usize,
 ) -> Result<Vec<String>, RBSError> {
@@ -95,7 +101,7 @@ pub async fn k_most_similar(
                 dmkey.clone(),
                 dot(
                     &new_emb,
-                    embs_set.get(&dmkey).expect("Embeddings not found"),
+                    &embs_set.get(&dmkey).expect("Embeddings not found").emb,
                 ),
             );
         }
@@ -142,70 +148,106 @@ fn dot(x: &Vec<f32>, y: &Vec<f32>) -> f32 {
 
 pub async fn optimize_average_weights(
     embedding_model_list: &[String],
-    data_set: Option<&[(String, String)]>, // Re-think this type to fit what-ever
+    given_data_set: Option<HashMap<DocModelKey, EmbMaybeLabel>>, // Re-think this type to fit what-ever
 ) -> Result<HashMap<String, f32>, RBSError> {
-    let (train_doc_w_labels, test_doc_w_lables): (Vec<(String, String)>, Vec<(String, String)>) =
-        match data_set {
-            Some(ds) => {
-                let size = ds.len(); // Adjust the size as needed
-                let true_count = (size as f64 * 0.8).round() as usize;
-                let false_count = size - true_count;
-                let mut split_locs: Vec<bool> = vec![true; true_count]
+    // Cut the train and test split? just do opti for what-ever is given
+    let data_set_w_labels: HashMap<DocModelKey, EmbMaybeLabel> = match given_data_set {
+        // (String, Vec<f32>)
+        Some(ds) => {
+            /*
+            let size = ds.len(); // Adjust the size as needed
+            let true_count = (size as f64 * 0.8).round() as usize;
+            let false_count = size - true_count;
+            let mut split_locs: Vec<bool> = vec![true; true_count]
+                .into_iter()
+                .chain(vec![false; false_count])
+                .collect();
+
+            let mut rng = SmallRng::seed_from_u64(42);
+
+            split_locs.shuffle(&mut rng);
+
+            let (rhs, lhs): (Vec<_>, Vec<_>) = ds
+                .to_vec()
+                .drain(..)
+                .zip(split_locs.into_iter())
+                .map(|(l, r)| (l.0, l.1, r))
+                .partition(|(_, _, b)| *b);
+            (
+                rhs.into_iter().map(|(x, y, _)| (x, y)).collect(),
+                lhs.into_iter().map(|(x, y, _)| (x, y)).collect(),
+            )
+            */
+            /*
+             */
+            ds
+        }
+        None => {
+            let hf_api = Api::new()?;
+            let repo = hf_api.dataset("SetFit/20_newsgroups".to_string());
+
+            let train_path = repo.get("train.jsonl")?;
+            let test_path = repo.get("test.jsonl")?;
+
+            let train_data_raw = fs::read(train_path)?;
+            let test_data_raw = fs::read(test_path)?;
+
+            // the error is here
+            let train_data = Deserializer::from_slice(&train_data_raw)
+                .into_iter::<NewsDP>()
+                .map(|x| x.unwrap());
+
+            let test_data = Deserializer::from_slice(&test_data_raw)
+                .into_iter::<NewsDP>()
+                .map(|x| x.unwrap());
+            let (documents, labels): (Vec<String>, Vec<String>) = train_data
+                .chain(test_data)
+                .map(|dp| (dp.text, dp.label_text))
+                .unzip();
+
+            let ollama_cli = ollama_rs::Ollama::default();
+            build_embeddings(
+                &ollama_cli,
+                &documents[..],
+                embedding_model_list,
+                Some(&labels.iter().map(|x| x.as_str()).collect::<Vec<&str>>()[..]),
+            )
+            .await
+            .unwrap()
+            //println!("{:#?}", train_data);
+            //println!("{:#?}", test_data);
+            /*
+            (
+                train_data
                     .into_iter()
-                    .chain(vec![false; false_count])
-                    .collect();
+                    .map(|dp| (dp.text, dp.label_text))
+                    .collect(),
+                test_data
+                    .into_iter()
+                    .map(|dp| (dp.text, dp.label_text))
+                    .collect(),
+            )
+            */
+        }
+    };
+    let doc_label_hash: HashMap<String, String> = data_set_w_labels
+        .into_iter()
+        .filter(|(k, v)| v.label.is_some())
+        .map(|(k, v)| (k.document, v.label.unwrap()))
+        .collect();
 
-                let mut rng = SmallRng::seed_from_u64(42);
-
-                split_locs.shuffle(&mut rng);
-
-                let (rhs, lhs): (Vec<_>, Vec<_>) = ds
-                    .to_vec()
-                    .drain(..)
-                    .zip(split_locs.into_iter())
-                    .map(|(l, r)| (l.0, l.1, r))
-                    .partition(|(_, _, b)| *b);
-                (
-                    rhs.into_iter().map(|(x, y, _)| (x, y)).collect(),
-                    lhs.into_iter().map(|(x, y, _)| (x, y)).collect(),
-                )
-            }
-            None => {
-                let hf_api = Api::new()?;
-                let repo = hf_api.dataset("SetFit/20_newsgroups".to_string());
-
-                let train_path = repo.get("train.jsonl")?;
-                let test_path = repo.get("test.jsonl")?;
-
-                let train_data_raw = fs::read(train_path)?;
-                let test_data_raw = fs::read(test_path)?;
-
-                // the error is here
-                let train_data: Vec<NewsDP> = Deserializer::from_slice(&train_data_raw)
-                    .into_iter::<NewsDP>()
-                    .map(|x| x.unwrap())
-                    .collect();
-
-                let test_data: Vec<NewsDP> = Deserializer::from_slice(&test_data_raw)
-                    .into_iter::<NewsDP>()
-                    .map(|x| x.unwrap())
-                    .collect();
-                //println!("{:#?}", train_data);
-                //println!("{:#?}", test_data);
-                (
-                    train_data
-                        .into_iter()
-                        .map(|dp| (dp.text, dp.label_text))
-                        .collect(),
-                    test_data
-                        .into_iter()
-                        .map(|dp| (dp.text, dp.label_text))
-                        .collect(),
-                )
-            }
-        };
     // Now add pso stuff
+    //let k_most_sim_many_k: Vec<> =
 
+    todo!()
+}
+
+async fn precs_at_ks(
+    data_set: HashMap<DocModelKey, EmbMaybeLabel>,
+    do_label_hash: HashMap<String, String>,
+    ks: Vec<usize>,
+    Targets: HashMap<DocModelKey, EmbMaybeLabel>,
+) -> Vec<usize> {
     todo!()
 }
 #[cfg(test)]
@@ -226,7 +268,7 @@ mod tests {
             "nomic-embed-text:latest".to_string(),
             "bge-m3:latest".to_string(),
         ];
-        let embs_set = build_embeddings(&ollama_cli, &doc_collection[..], &models[..])
+        let embs_set = build_embeddings(&ollama_cli, &doc_collection[..], &models[..], None)
             .await
             .unwrap();
 
@@ -254,7 +296,7 @@ mod tests {
             "nomic-embed-text:latest".to_string(),
             "bge-m3:latest".to_string(),
         ];
-        let embs_set = build_embeddings(&ollama_cli, &doc_collection[..], &models[..])
+        let embs_set = build_embeddings(&ollama_cli, &doc_collection[..], &models[..], None)
             .await
             .unwrap();
 
@@ -278,8 +320,12 @@ mod tests {
         assert_eq!(top_ks_unorderd, my_guesses);
     }
 
-    #[tokio::test]
-    async fn opt_weights_emb_and_top_k_test() {}
+    /*
+        #[tokio::test]
+        async fn opt_weights_emb_and_top_k_test() {
+
+        }
+    */
 
     #[tokio::test]
     async fn optimizer_test_20news() {
