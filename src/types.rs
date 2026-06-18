@@ -1,5 +1,6 @@
 use std::{cmp::Ordering, io::Error};
 
+use argmin::core::Error as ArgError;
 use hf_hub::api::sync::ApiError;
 use ollama_rs::error::OllamaError;
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,7 @@ pub struct DocModelKey {
     pub document: String,
     pub model: String,
 }
+#[derive(Clone)]
 pub struct EmbMaybeLabel {
     pub emb: Vec<f32>,
     pub label: Option<String>,
@@ -28,6 +30,7 @@ pub enum RBSError {
     HuggingFace(String),
     ReadFile(String),
     Json(String),
+    Argmin(String),
 }
 
 impl From<OllamaError> for RBSError {
@@ -50,7 +53,13 @@ impl From<Error> for RBSError {
 
 impl From<JSError> for RBSError {
     fn from(err: JSError) -> RBSError {
-        RBSError::ReadFile(err.to_string())
+        RBSError::Json(err.to_string())
+    }
+}
+
+impl From<ArgError> for RBSError {
+    fn from(err: ArgError) -> RBSError {
+        RBSError::Argmin(err.to_string())
     }
 }
 

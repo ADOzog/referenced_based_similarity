@@ -2,15 +2,24 @@ mod types;
 use std::{
     collections::{BinaryHeap, HashMap, HashSet},
     fs,
+    ops::Deref,
     sync::Arc,
     vec,
 };
 
-use futures::future::try_join_all;
+use argmin::solver::particleswarm::ParticleSwarm;
+use argmin::{
+    core::{CostFunction, Error, Executor},
+    solver,
+};
+use futures::{executor::block_on, future::try_join_all};
 use hf_hub::api::sync::Api;
 use ollama_rs::{Ollama, generation::embeddings::request::GenerateEmbeddingsRequest};
-use pso_rs::*;
-use rand::{SeedableRng, rngs::SmallRng, seq::SliceRandom};
+use rand::{
+    SeedableRng,
+    rngs::{SmallRng, StdRng},
+    seq::SliceRandom,
+};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde_json::Deserializer;
 use types::*;
@@ -182,23 +191,20 @@ async fn init_20news(
     let ollama_cli = ollama_rs::Ollama::default();
     build_embeddings(
         &ollama_cli,
-        &documents[..],
+        &documents[..=50],
         embedding_model_list,
-        Some(&labels.iter().map(|x| x.as_str()).collect::<Vec<&str>>()[..]),
+        Some(&labels.iter().map(|x| x.as_str()).collect::<Vec<&str>>()[..=50]),
     )
     .await
 }
 
-async fn RBS_obj_fn(
-    p: &Particle,
-    _flat_dim: usize,
-    _dimensions: &Vec<usize>,
-    // The non PSO stuff
+fn obj_fn_builder(
+    given_weights: &[f64],
     data_set: HashMap<DocModelKey, EmbMaybeLabel>,
-    ks: Vec<usize>,
-    given_runs: Option<usize>,
+    ks: &Vec<usize>,
+    given_runs: &Option<usize>,
     embedding_model_list: &[String],
-    doc_label_hash: HashMap<String, String>,
+    doc_label_hash: &HashMap<String, String>,
 ) -> f64 {
     let size = data_set.len(); // Adjust the size as needed
     let runs = given_runs.unwrap_or(30);
@@ -230,15 +236,16 @@ async fn RBS_obj_fn(
 
     let k_max: &usize = ks.iter().max().unwrap();
     // Build the weights here
-    let ws: HashMap<&str, f32> = p
+
+    let ws: HashMap<&str, f32> = given_weights
         .into_iter()
         .zip(embedding_model_list)
         .map(|(l, r)| (r.as_str(), *l as f32))
         .collect();
-    // wrap tain in a clone
+    // wrap train in a clone
     let arc_train = Arc::new(train);
 
-    let ks_for_each_tar: Vec<Vec<String>> = try_join_all(
+    let ks_for_each_tar: Vec<Vec<String>> = block_on(try_join_all(
         targets
             .par_iter()
             .map(|target| {
@@ -257,12 +264,12 @@ async fn RBS_obj_fn(
                 }
             })
             .collect::<Vec<_>>(),
-    )
-    .await
+    ))
     .unwrap_or_default();
 
     let arc_doc_label_hash = Arc::new(doc_label_hash);
 
+    // This needs to be fixed for each k next
     average(
         &ks_for_each_tar
             .into_iter()
@@ -281,51 +288,77 @@ async fn RBS_obj_fn(
     )
 }
 
+struct PSOobj {
+    given_weights: Vec<f64>,
+    data_set: HashMap<DocModelKey, EmbMaybeLabel>,
+    ks: Vec<usize>,
+    given_runs: Option<usize>,
+    embedding_model_list: Vec<String>,
+    doc_label_hash: HashMap<String, String>,
+}
+
+impl CostFunction for PSOobj {
+    type Param = Vec<f64>;
+    type Output = f64;
+
+    fn cost(&self, param: &Self::Param) -> Result<Self::Output, Error> {
+        // Negative
+        Ok(obj_fn_builder(
+            param.as_slice(),
+            self.data_set.clone(),
+            &self.ks,
+            &self.given_runs,
+            &self.embedding_model_list,
+            &self.doc_label_hash,
+        ))
+    }
+}
+
 pub async fn optimize_average_weights(
     embedding_model_list: &[String],
     given_data_set: Option<HashMap<DocModelKey, EmbMaybeLabel>>, // Re-think this type to fit what-ever
     given_ks: Option<Vec<usize>>,
+    given_runs: Option<usize>,
 ) -> Result<HashMap<String, f32>, RBSError> {
     // Cut the train and test split? just do opti for what-ever is given
+    // Re-think the clones in this function, write paper first
     let data_set_w_labels: HashMap<DocModelKey, EmbMaybeLabel> =
         given_data_set.unwrap_or(init_20news(embedding_model_list).await?);
     let ks = given_ks.unwrap_or(vec![1, 2, 4, 8, 16, 32, 64]);
     let doc_label_hash: HashMap<String, String> = data_set_w_labels
+        .clone()
         .into_iter()
         .filter(|(_k, v)| v.label.is_some())
         .map(|(k, v)| (k.document, v.label.unwrap()))
         .collect();
 
-    // Now add pso stuff
-    //let k_most_sim_many_k: Vec<> =
     let number_of_models: usize = embedding_model_list.len();
-    let pso_config = Config {
-        dimensions: vec![number_of_models],
-        bounds: vec![(0.0, 1.0); number_of_models],
-        t_max: 100000,
-        parallelize: true,
-        population_size: 20,
-        neighborhood_type: NeighborhoodType::Lbest,
-        ..Config::default()
+    let cost_function: PSOobj = PSOobj {
+        given_weights: vec![0.0; number_of_models],
+        data_set: data_set_w_labels.clone(),
+        ks,
+        given_runs,
+        embedding_model_list: embedding_model_list.to_vec(),
+        doc_label_hash,
     };
-    let built_obj_fn: fn(&Particle, usize, &Vec<usize>) -> f64 =
-        async move |p: &Particle, _flat_dim: usize, _dimensions: &Vec<usize>| {
-            {
-                RBS_obj_fn(
-                    p,
-                    _flat_dim,
-                    _dimensions,
-                    data_set_w_labels,
-                    ks,
-                    None,
-                    embedding_model_list,
-                    doc_label_hash,
-                )
-            }
-        };
-
-    let pso_res = pso_rs::run(pso_config, built_obj_fn, None);
-    todo!()
+    let pso_solver = ParticleSwarm::new(
+        (vec![0.0; number_of_models], vec![1.0; number_of_models]),
+        40,
+    );
+    println!("right before exec");
+    let res = Executor::new(cost_function, pso_solver)
+        .configure(|state| state.max_iters(100))
+        .run()?
+        .state
+        .best_individual
+        .expect("Failed right here")
+        .position;
+    println!("After the opt");
+    Ok(embedding_model_list
+        .to_vec()
+        .into_iter()
+        .zip(res.into_iter().map(|x| x as f32))
+        .collect())
 }
 
 /*
@@ -421,9 +454,11 @@ mod tests {
             "nomic-embed-text:latest".to_string(),
             "bge-m3:latest".to_string(),
         ];
-        let ws: HashMap<String, f32> = optimize_average_weights(&models[..], Option::None)
-            .await
-            .unwrap();
+        let ws: HashMap<String, f32> =
+            optimize_average_weights(&models[..], Option::None, Option::None, Option::None)
+                .await
+                .unwrap();
+        println!("{:#?}", ws);
     }
     /*
     #[tokio::test]
