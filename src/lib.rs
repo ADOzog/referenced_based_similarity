@@ -3,23 +3,11 @@ use std::{
     collections::{BinaryHeap, HashMap, HashSet},
     fs,
     ops::Deref,
-    sync::Arc,
     vec,
 };
 
-use argmin::solver::particleswarm::ParticleSwarm;
-use argmin::{
-    core::{CostFunction, Error, Executor},
-    solver,
-};
-use futures::{executor::block_on, future::try_join_all};
 use hf_hub::api::sync::Api;
 use ollama_rs::{Ollama, generation::embeddings::request::GenerateEmbeddingsRequest};
-use rand::{
-    SeedableRng,
-    rngs::{SmallRng, StdRng},
-    seq::SliceRandom,
-};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde_json::Deserializer;
 use types::*;
@@ -37,23 +25,20 @@ pub async fn build_embeddings(
     let mut embs_of_doc: HashMap<DocModelKey, EmbMaybeLabel> = HashMap::new();
     for m in embedding_model_list {
         let emb_request = GenerateEmbeddingsRequest::new(m.to_string(), documents.to_vec().into());
-        let mut res = ollama_cli
+        let gen_embeddings = ollama_cli
             .generate_embeddings(emb_request)
             .await?
             .embeddings
             .into_iter();
-        for i in 0..res.len() {
+        for (i, emb) in gen_embeddings.into_iter().enumerate() {
             embs_of_doc.insert(
                 DocModelKey {
                     document: documents[i].to_string(),
                     model: m.to_string(),
                 },
                 EmbMaybeLabel {
-                    emb: res.next().unwrap(),
-                    label: match labels {
-                        Some(l) => Some(l[i].to_string()),
-                        None => None,
-                    },
+                    emb,
+                    label: labels.and_then(|l| l.get(i).map(|s| s.to_string())),
                 },
             );
         }
@@ -148,6 +133,7 @@ pub async fn k_most_similar(
 
     let mut heap: BinaryHeap<Scores> = BinaryHeap::from(w_avgs);
     let mut top_k_docs: Vec<String> = vec!["".to_string(); k];
+    // fix the logic here
     for i in 0..k {
         top_k_docs[i] = heap.pop().unwrap().document;
     }
@@ -161,6 +147,12 @@ fn dot(x: &Vec<f32>, y: &Vec<f32>) -> f32 {
 fn average(vec: &Vec<f64>) -> f64 {
     let sum: f64 = vec.par_iter().sum();
     sum / vec.len() as f64
+}
+fn softmax(xs: &[f32]) -> Vec<f32> {
+    let max = xs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = xs.par_iter().map(|x| (x - max).exp()).collect();
+    let sum: f32 = exps.par_iter().sum();
+    exps.par_iter().map(|e| e / sum).collect()
 }
 
 async fn init_20news(
@@ -191,13 +183,14 @@ async fn init_20news(
     let ollama_cli = ollama_rs::Ollama::default();
     build_embeddings(
         &ollama_cli,
-        &documents[..=50],
+        &documents[..=2000],
         embedding_model_list,
         Some(&labels.iter().map(|x| x.as_str()).collect::<Vec<&str>>()[..=50]),
     )
     .await
 }
 
+/*
 fn obj_fn_builder(
     given_weights: &[f64],
     data_set: HashMap<DocModelKey, EmbMaybeLabel>,
@@ -287,31 +280,51 @@ fn obj_fn_builder(
             .collect(),
     )
 }
+*/
 
-struct PSOobj {
-    given_weights: Vec<f64>,
-    data_set: HashMap<DocModelKey, EmbMaybeLabel>,
-    ks: Vec<usize>,
-    given_runs: Option<usize>,
-    embedding_model_list: Vec<String>,
-    doc_label_hash: HashMap<String, String>,
+async fn avg_score_for_k(
+    ks: &Vec<usize>,
+    doc_label_hash: &HashMap<String, String>,
+    ollama_cli: &Ollama,
+    embs_set: &HashMap<DocModelKey, EmbMaybeLabel>,
+    weights: Option<HashMap<&str, f32>>,
+) -> Result<f32, RBSError> {
+    let mut score_at_k: Vec<f32> = vec![];
+    for k in ks {
+        let mut sum_at_k = 0;
+        for (doc, label) in doc_label_hash.clone() {
+            let found_docs =
+                k_most_similar(&ollama_cli, &doc, &embs_set, weights.clone(), *k).await?;
+            for f_doc in found_docs {
+                if label == doc_label_hash.get(&f_doc).unwrap_or(&String::new()).deref() {
+                    sum_at_k += 1;
+                }
+            }
+            score_at_k.push((sum_at_k / k) as f32);
+        }
+    }
+    Ok(score_at_k.iter().sum::<f32>() / score_at_k.len() as f32)
 }
 
-impl CostFunction for PSOobj {
-    type Param = Vec<f64>;
-    type Output = f64;
+async fn fin_diff_grad(
+    ks: &Vec<usize>,
+    doc_label_hash: &HashMap<String, String>,
+    ollama_cli: &Ollama,
+    embs_set: &HashMap<DocModelKey, EmbMaybeLabel>,
+    weights: Option<HashMap<&str, f32>>,
+    theta: &[f32],
+    eps: f32,
+) -> Result<Vec<f32>, RBSError> {
+    let mut grad = vec![0.0; theta.len()];
+    let base = avg_score_for_k(ks, doc_label_hash, ollama_cli, embs_set, weights.clone()).await?;
 
-    fn cost(&self, param: &Self::Param) -> Result<Self::Output, Error> {
-        // Negative
-        Ok(obj_fn_builder(
-            param.as_slice(),
-            self.data_set.clone(),
-            &self.ks,
-            &self.given_runs,
-            &self.embedding_model_list,
-            &self.doc_label_hash,
-        ))
+    for i in 0..theta.len() {
+        let mut t = theta.to_vec();
+        t[i] += eps;
+        let v = avg_score_for_k(ks, doc_label_hash, ollama_cli, embs_set, weights.clone()).await?;
+        grad[i] = (v - base) / eps;
     }
+    Ok(grad)
 }
 
 pub async fn optimize_average_weights(
@@ -322,42 +335,90 @@ pub async fn optimize_average_weights(
 ) -> Result<HashMap<String, f32>, RBSError> {
     // Cut the train and test split? just do opti for what-ever is given
     // Re-think the clones in this function, write paper first
+    let ollama_cli = ollama_rs::Ollama::default();
     let data_set_w_labels: HashMap<DocModelKey, EmbMaybeLabel> =
         given_data_set.unwrap_or(init_20news(embedding_model_list).await?);
+    println!(
+        "The number of data points is {:#?}",
+        data_set_w_labels.len(),
+    );
     let ks = given_ks.unwrap_or(vec![1, 2, 4, 8, 16, 32, 64]);
     let doc_label_hash: HashMap<String, String> = data_set_w_labels
-        .clone()
         .into_iter()
-        .filter(|(_k, v)| v.label.is_some())
-        .map(|(k, v)| (k.document, v.label.unwrap()))
+        .filter_map(|(k, v)| {
+            v.label
+                .as_ref()
+                .map(|label| (k.document.clone(), label.clone()))
+        })
         .collect();
+    let embs_set = build_embeddings(
+        &ollama_cli,
+        &doc_label_hash
+            .clone()
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect::<Vec<String>>(),
+        embedding_model_list,
+        Some(
+            &doc_label_hash
+                .iter()
+                .map(|(_, l)| l.as_str())
+                .collect::<Vec<&str>>(),
+        ),
+    )
+    .await?;
+    let runs = given_runs.unwrap_or(100);
 
     let number_of_models: usize = embedding_model_list.len();
-    let cost_function: PSOobj = PSOobj {
-        given_weights: vec![0.0; number_of_models],
-        data_set: data_set_w_labels.clone(),
-        ks,
-        given_runs,
-        embedding_model_list: embedding_model_list.to_vec(),
-        doc_label_hash,
-    };
-    let pso_solver = ParticleSwarm::new(
-        (vec![0.0; number_of_models], vec![1.0; number_of_models]),
-        40,
-    );
-    println!("right before exec");
-    let res = Executor::new(cost_function, pso_solver)
-        .configure(|state| state.max_iters(100))
-        .run()?
-        .state
-        .best_individual
-        .expect("Failed right here")
-        .position;
-    println!("After the opt");
+    let mut theta: Vec<f32> = vec![0.0; number_of_models];
+
+    let eps: f32 = 1e-3;
+    let mut best_theta = theta.clone();
+    let mut best_score = f32::NEG_INFINITY;
+
+    for _ in 0..runs {
+        let weights: HashMap<&str, f32> = softmax(&theta)
+            .into_iter()
+            .zip(embedding_model_list.iter())
+            .map(|(f, s)| (s.as_str(), f))
+            .collect();
+
+        let score = avg_score_for_k(
+            &ks,
+            &doc_label_hash.clone(),
+            &ollama_cli,
+            &embs_set,
+            Some(weights.clone()),
+        )
+        .await?;
+        if score > best_score {
+            best_score = score;
+            best_theta = theta.clone();
+        }
+
+        let grad = fin_diff_grad(
+            &ks,
+            &doc_label_hash,
+            &ollama_cli,
+            &embs_set,
+            Some(weights.clone()),
+            &theta,
+            eps,
+        )
+        .await?;
+        let lr: f32 = 0.1;
+        for i in 0..number_of_models {
+            theta[i] += lr * grad[i];
+        }
+    }
+    let final_weights = softmax(&best_theta);
+
+    // res should be the list of weights
+
     Ok(embedding_model_list
         .to_vec()
         .into_iter()
-        .zip(res.into_iter().map(|x| x as f32))
+        .zip(final_weights.into_iter().map(|x| x as f32))
         .collect())
 }
 
