@@ -1,4 +1,5 @@
 mod types;
+use core::num;
 use std::{
     collections::{BinaryHeap, HashMap, HashSet},
     fs,
@@ -62,6 +63,7 @@ pub async fn k_most_similar(
 
     let num_of_models: usize = list_of_models.len();
     let num_of_docs: usize = list_of_docs.len();
+    //println!("{:#?}", num_of_docs);
     let models: Vec<&str> = list_of_models.into_iter().collect();
     let docs: Vec<&str> = list_of_docs.into_iter().collect();
 
@@ -85,11 +87,19 @@ pub async fn k_most_similar(
     for i in 0..num_of_models {
         let emb_request =
             GenerateEmbeddingsRequest::new(models[i].to_string(), doc.to_string().into());
-        let new_emb: Vec<f32> = (*ollama_cli
+        let new_emb: Vec<f32> = match ollama_cli
             .generate_embeddings(emb_request)
             .await?
-            .embeddings[0])
-            .to_vec();
+            .embeddings
+            .get(0)
+        {
+            Some(emb) => emb.to_vec(),
+            None => {
+                println!("This doc gave no embedding {:#?}", doc);
+                assert!(false);
+                unreachable!()
+            }
+        };
         for d in &docs {
             let dmkey = DocModelKey {
                 document: d.to_string(),
@@ -121,8 +131,9 @@ pub async fn k_most_similar(
                 model: m.to_string(),
             };
             sum += ws.get(m).unwrap() * new_sims.get(&dmkey).unwrap();
+            //println!("the sum was,{:#?}", sum)
         }
-        // update w_avgs here
+        // updantlnte w_avgs here
         w_avgs[counter] = Scores {
             document: d.to_string(),
             score: sum,
@@ -134,7 +145,7 @@ pub async fn k_most_similar(
     let mut heap: BinaryHeap<Scores> = BinaryHeap::from(w_avgs);
     let mut top_k_docs: Vec<String> = vec!["".to_string(); k];
     // fix the logic here
-    for i in 0..k {
+    for i in 0..k.min(top_k_docs.len()) {
         top_k_docs[i] = heap.pop().unwrap().document;
     }
     Ok(top_k_docs)
@@ -177,15 +188,16 @@ async fn init_20news(
         .map(|x| x.unwrap());
     let (documents, labels): (Vec<String>, Vec<String>) = train_data
         .chain(test_data)
+        .filter(|dp| !dp.text.is_empty() || !dp.label_text.is_empty())
         .map(|dp| (dp.text, dp.label_text))
         .unzip();
 
     let ollama_cli = ollama_rs::Ollama::default();
     build_embeddings(
         &ollama_cli,
-        &documents[..=2000],
+        &documents[..=500],
         embedding_model_list,
-        Some(&labels.iter().map(|x| x.as_str()).collect::<Vec<&str>>()[..=50]),
+        Some(&labels.iter().map(|x| x.as_str()).collect::<Vec<&str>>()[..500]),
     )
     .await
 }
@@ -293,9 +305,13 @@ async fn avg_score_for_k(
     for k in ks {
         let mut sum_at_k = 0;
         for (doc, label) in doc_label_hash.clone() {
+            if doc.is_empty() {
+                println!("An empty doc was found with label {:#?}", label)
+            }
             let found_docs =
                 k_most_similar(&ollama_cli, &doc, &embs_set, weights.clone(), *k).await?;
             for f_doc in found_docs {
+                // small fix here maybe? nah
                 if label == doc_label_hash.get(&f_doc).unwrap_or(&String::new()).deref() {
                     sum_at_k += 1;
                 }
@@ -344,29 +360,25 @@ pub async fn optimize_average_weights(
     );
     let ks = given_ks.unwrap_or(vec![1, 2, 4, 8, 16, 32, 64]);
     let doc_label_hash: HashMap<String, String> = data_set_w_labels
+        .clone()
         .into_iter()
         .filter_map(|(k, v)| {
             v.label
                 .as_ref()
                 .map(|label| (k.document.clone(), label.clone()))
         })
+        // should be the fix
+        .filter(|(k, v)| !(k.is_empty() || v.is_empty()))
         .collect();
-    let embs_set = build_embeddings(
-        &ollama_cli,
-        &doc_label_hash
-            .clone()
-            .into_iter()
-            .map(|(d, _)| d)
-            .collect::<Vec<String>>(),
-        embedding_model_list,
-        Some(
-            &doc_label_hash
-                .iter()
-                .map(|(_, l)| l.as_str())
-                .collect::<Vec<&str>>(),
-        ),
-    )
-    .await?;
+    let labeled_docs: Vec<(String, String)> = data_set_w_labels
+        .into_iter()
+        .filter_map(|(k, v)| v.label.map(|label| (k.document, label)))
+        .collect();
+
+    let docs: Vec<String> = labeled_docs.iter().map(|(d, _)| d.clone()).collect();
+    let labels: Vec<&str> = labeled_docs.iter().map(|(_, l)| l.as_str()).collect();
+    let embs_set =
+        build_embeddings(&ollama_cli, &docs, embedding_model_list, Some(&labels)).await?;
     let runs = given_runs.unwrap_or(100);
 
     let number_of_models: usize = embedding_model_list.len();
