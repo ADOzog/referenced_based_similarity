@@ -5,14 +5,14 @@ use ollama_rs::error::OllamaError;
 use serde::{Deserialize, Serialize};
 use serde_json::Error as JSError;
 #[derive(Eq, Hash, PartialEq, Clone)]
-pub struct DocModelKey {
-    pub document: String,
-    pub model: String,
+pub struct DocModelKey<'a> {
+    pub document: &'a str,
+    pub model: &'a str,
 }
 #[derive(Clone)]
-pub struct EmbMaybeLabel {
+pub struct EmbMaybeLabel<'a> {
     pub emb: Vec<f32>,
-    pub label: Option<String>,
+    pub label: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

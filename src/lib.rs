@@ -14,49 +14,48 @@ use serde_json::Deserializer;
 use types::*;
 
 // Add an individual test for this
-pub async fn build_embeddings(
+pub async fn build_embeddings<'a>(
     ollama_cli: &Ollama,
-    documents: &[String],
-    embedding_model_list: &[String],
-    labels: Option<&[&str]>, // truncate: Option<bool>,
-) -> Result<HashMap<DocModelKey, EmbMaybeLabel>, RBSError> {
-    // add code to test that ollama is running else ret error and tell user
-    // add code validate models using ollama list
-    // need to change in the future to allow use to input stuff
-    let mut embs_of_doc: HashMap<DocModelKey, EmbMaybeLabel> = HashMap::new();
+    documents: &'a [String],
+    embedding_model_list: &'a [String],
+    labels: Option<&'a [&'a str]>, // truncate: Option<bool>,
+) -> Result<HashMap<DocModelKey<'a>, EmbMaybeLabel<'a>>, RBSError> {
+    let mut embs_of_doc = HashMap::new();
+
     for m in embedding_model_list {
-        let emb_request = GenerateEmbeddingsRequest::new(m.to_string(), documents.to_vec().into());
-        let gen_embeddings = ollama_cli
+        let emb_request = GenerateEmbeddingsRequest::new(m.clone(), documents.to_vec().into());
+        let embeddings = ollama_cli
             .generate_embeddings(emb_request)
             .await?
-            .embeddings
-            .into_iter();
-        for (i, emb) in gen_embeddings.into_iter().enumerate() {
+            .embeddings;
+
+        for (i, (doc, emb)) in documents.iter().zip(embeddings.into_iter()).enumerate() {
             embs_of_doc.insert(
                 DocModelKey {
-                    document: documents[i].to_string(),
-                    model: m.to_string(),
+                    document: doc,
+                    model: m,
                 },
                 EmbMaybeLabel {
                     emb,
-                    label: labels.and_then(|l| l.get(i).map(|s| s.to_string())),
+                    label: labels.and_then(|l| l.get(i).copied()),
                 },
             );
         }
     }
+
     Ok(embs_of_doc)
 }
 
-pub async fn k_most_similar(
+pub async fn k_most_similar<'a>(
     ollama_cli: &Ollama,
     doc: &str,
-    embs_set: &HashMap<DocModelKey, EmbMaybeLabel>,
+    embs_set: &HashMap<DocModelKey<'a>, EmbMaybeLabel<'a>>,
     avg_weights: Option<HashMap<&str, f32>>,
     k: usize,
 ) -> Result<Vec<String>, RBSError> {
     let (list_of_docs, list_of_models): (HashSet<&str>, HashSet<&str>) = embs_set
         .iter()
-        .map(|(key, _value)| (key.document.as_str(), key.model.as_str()))
+        .map(|(key, _value)| (key.document, key.model))
         .unzip();
 
     let mut new_sims: HashMap<DocModelKey, f32> = HashMap::new();
@@ -95,15 +94,15 @@ pub async fn k_most_similar(
         {
             Some(emb) => emb.to_vec(),
             None => {
-                println!("This doc gave no embedding {:#?}", doc);
-                assert!(false);
-                unreachable!()
+                return Err(RBSError::KMostSim(format!(
+                    "No embedding returned for doc: {doc}"
+                )));
             }
         };
         for d in &docs {
             let dmkey = DocModelKey {
-                document: d.to_string(),
-                model: models[i].to_string(),
+                document: d,
+                model: models[i],
             };
             new_sims.insert(
                 dmkey.clone(),
@@ -127,8 +126,8 @@ pub async fn k_most_similar(
         let mut sum: f32 = 0.0;
         for m in &models {
             let dmkey = DocModelKey {
-                document: d.to_string(),
-                model: m.to_string(),
+                document: d,
+                model: m,
             };
             sum += ws.get(m).unwrap() * new_sims.get(&dmkey).unwrap();
             //println!("the sum was,{:#?}", sum)
@@ -143,10 +142,12 @@ pub async fn k_most_similar(
     // From here just get the top k
 
     let mut heap: BinaryHeap<Scores> = BinaryHeap::from(w_avgs);
-    let mut top_k_docs: Vec<String> = vec!["".to_string(); k];
-    // fix the logic here
-    for i in 0..k.min(top_k_docs.len()) {
-        top_k_docs[i] = heap.pop().unwrap().document;
+    let mut top_k_docs = Vec::with_capacity(k);
+
+    for _ in 0..k.min(num_of_docs) {
+        if let Some(score) = heap.pop() {
+            top_k_docs.push(score.document);
+        }
     }
     Ok(top_k_docs)
 }
@@ -154,10 +155,6 @@ pub async fn k_most_similar(
 // Add a test for this
 fn dot(x: &Vec<f32>, y: &Vec<f32>) -> f32 {
     x.par_iter().zip(y.par_iter()).map(|(a, b)| a * b).sum()
-}
-fn average(vec: &Vec<f64>) -> f64 {
-    let sum: f64 = vec.par_iter().sum();
-    sum / vec.len() as f64
 }
 fn softmax(xs: &[f32]) -> Vec<f32> {
     let max = xs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -178,122 +175,27 @@ async fn init_20news(
     let train_data_raw = fs::read(train_path)?;
     let test_data_raw = fs::read(test_path)?;
 
-    // the error is here
-    let train_data = Deserializer::from_slice(&train_data_raw)
+    let (documents, labels): (Vec<String>, Vec<String>) = Deserializer::from_slice(&train_data_raw)
         .into_iter::<NewsDP>()
-        .map(|x| x.unwrap());
-
-    let test_data = Deserializer::from_slice(&test_data_raw)
-        .into_iter::<NewsDP>()
-        .map(|x| x.unwrap());
-    let (documents, labels): (Vec<String>, Vec<String>) = train_data
-        .chain(test_data)
-        .filter(|dp| !dp.text.is_empty() || !dp.label_text.is_empty())
+        .chain(Deserializer::from_slice(&test_data_raw).into_iter::<NewsDP>())
+        .collect::<Result<Vec<NewsDP>, _>>()?
+        .into_iter()
+        .filter(|dp| !dp.text.is_empty() && !dp.label_text.is_empty())
         .map(|dp| (dp.text, dp.label_text))
         .unzip();
 
+    let n = documents.len().min(501);
+
+    let docs = documents.into_iter().take(n).collect::<Vec<_>>();
+    let labs = labels.into_iter().take(n).collect::<Vec<_>>();
+
     let ollama_cli = ollama_rs::Ollama::default();
-    build_embeddings(
-        &ollama_cli,
-        &documents[..=500],
-        embedding_model_list,
-        Some(&labels.iter().map(|x| x.as_str()).collect::<Vec<&str>>()[..500]),
-    )
-    .await
+    let label_refs: Vec<&str> = labs.iter().map(|s| s.as_str()).collect();
+
+    build_embeddings(&ollama_cli, &docs, embedding_model_list, Some(&label_refs)).await
 }
 
-/*
-fn obj_fn_builder(
-    given_weights: &[f64],
-    data_set: HashMap<DocModelKey, EmbMaybeLabel>,
-    ks: &Vec<usize>,
-    given_runs: &Option<usize>,
-    embedding_model_list: &[String],
-    doc_label_hash: &HashMap<String, String>,
-) -> f64 {
-    let size = data_set.len(); // Adjust the size as needed
-    let runs = given_runs.unwrap_or(30);
-    let true_count = size - runs;
-    let false_count = runs;
-    let mut split_locs: Vec<bool> = vec![true; true_count]
-        .into_iter()
-        .chain(vec![false; false_count])
-        .collect();
-
-    let mut rng = SmallRng::seed_from_u64(42);
-
-    split_locs.shuffle(&mut rng);
-
-    let (train_w_bool, target_w_bool): (
-        Vec<(DocModelKey, EmbMaybeLabel, bool)>,
-        Vec<(DocModelKey, EmbMaybeLabel, bool)>,
-    ) = data_set
-        .into_iter()
-        .zip(split_locs.drain(..))
-        .map(|(l, r)| (l.0, l.1, r))
-        .partition(|(_, _, b)| *b);
-    let train: HashMap<DocModelKey, EmbMaybeLabel> =
-        train_w_bool.into_iter().map(|a| (a.0, a.1)).collect();
-    let (targets, labels): (Vec<String>, Vec<String>) = target_w_bool
-        .into_iter()
-        .map(|a| (a.0.document, a.1.label.unwrap_or_default()))
-        .unzip();
-
-    let k_max: &usize = ks.iter().max().unwrap();
-    // Build the weights here
-
-    let ws: HashMap<&str, f32> = given_weights
-        .into_iter()
-        .zip(embedding_model_list)
-        .map(|(l, r)| (r.as_str(), *l as f32))
-        .collect();
-    // wrap train in a clone
-    let arc_train = Arc::new(train);
-
-    let ks_for_each_tar: Vec<Vec<String>> = block_on(try_join_all(
-        targets
-            .par_iter()
-            .map(|target| {
-                let sub_train = arc_train.clone();
-                let value = ws.clone();
-                let ollama_cli = ollama_rs::Ollama::default();
-                async move {
-                    k_most_similar(
-                        &ollama_cli,
-                        &target,
-                        &sub_train,
-                        Some(value.clone()),
-                        *k_max,
-                    )
-                    .await
-                }
-            })
-            .collect::<Vec<_>>(),
-    ))
-    .unwrap_or_default();
-
-    let arc_doc_label_hash = Arc::new(doc_label_hash);
-
-    // This needs to be fixed for each k next
-    average(
-        &ks_for_each_tar
-            .into_iter()
-            .zip(labels.into_iter())
-            .map(|(data, label)| {
-                data.into_iter()
-                    .map({
-                        let dict = arc_doc_label_hash.clone();
-                        move |text| *dict.get(&text).unwrap_or(&String::new()) == label
-                    })
-                    .map(|tf| tf as usize as f64)
-                    .collect::<Vec<f64>>()
-            })
-            .map(|sub_vec| average(&sub_vec))
-            .collect(),
-    )
-}
-*/
-
+/* come back to here test rest first
 async fn avg_score_for_k(
     ks: &Vec<usize>,
     doc_label_hash: &HashMap<String, String>,
@@ -444,6 +346,8 @@ async fn precs_at_ks(
     todo!()
 }
 */
+*/
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,6 +419,7 @@ mod tests {
     }
 
     /*
+    /*
         #[tokio::test]
         async fn opt_weights_emb_and_top_k_test() {
 
@@ -543,5 +448,6 @@ mod tests {
         let the_opt_fn: fn(&[String], Option<&[String]>) -> HashMap<String, f32> =
             optimize_average_weights(embedding_model_list, data_set);
     }
+    */
     */
 }
