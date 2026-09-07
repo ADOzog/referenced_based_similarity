@@ -1,10 +1,7 @@
 mod types;
-use core::num;
 use std::{
     collections::{BinaryHeap, HashMap, HashSet},
-    fs,
-    ops::Deref,
-    vec,
+    fs, vec,
 };
 
 use hf_hub::api::sync::Api;
@@ -195,7 +192,6 @@ async fn init_20news(
     build_embeddings(&ollama_cli, &docs, embedding_model_list, Some(&label_refs)).await
 }
 
-/* come back to here test rest first
 async fn avg_score_for_k(
     ks: &Vec<usize>,
     doc_label_hash: &HashMap<String, String>,
@@ -336,18 +332,6 @@ pub async fn optimize_average_weights(
         .collect())
 }
 
-/*
-async fn precs_at_ks(
-    data_set: HashMap<DocModelKey, EmbMaybeLabel>,
-    do_label_hash: HashMap<String, String>,
-    ks: Vec<usize>,
-    Targets: HashMap<DocModelKey, EmbMaybeLabel>,
-) -> Vec<usize> {
-    todo!()
-}
-*/
-*/
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,14 +402,6 @@ mod tests {
         assert_eq!(top_ks_unorderd, my_guesses);
     }
 
-    /*
-    /*
-        #[tokio::test]
-        async fn opt_weights_emb_and_top_k_test() {
-
-        }
-    */
-
     #[tokio::test]
     async fn optimizer_test_20news() {
         let models = vec![
@@ -448,6 +424,5 @@ mod tests {
         let the_opt_fn: fn(&[String], Option<&[String]>) -> HashMap<String, f32> =
             optimize_average_weights(embedding_model_list, data_set);
     }
-    */
     */
 }
